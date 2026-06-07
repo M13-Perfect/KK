@@ -1,0 +1,4 @@
+# Python 缓存与测试产物
+__pycache__/
+*.py[cod]
+.pytest_cache/
