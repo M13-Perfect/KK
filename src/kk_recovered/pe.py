@@ -7,14 +7,49 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from pathlib import Path
+import datetime as _dt
+import hashlib
 import math
+from pathlib import Path
 import struct
 from typing import Iterable
 
 
 class PEFormatError(ValueError):
     """输入文件不是当前解析器支持的 PE 文件时抛出。"""
+
+
+DATA_DIRECTORY_NAMES = {
+    0: "导出表",
+    1: "导入表",
+    2: "资源表",
+    3: "异常表",
+    4: "证书表",
+    5: "重定位表",
+    6: "调试表",
+    7: "架构表",
+    8: "全局指针",
+    9: "TLS 表",
+    10: "加载配置",
+    11: "绑定导入",
+    12: "IAT",
+    13: "延迟导入",
+    14: ".NET 运行时",
+    15: "保留目录",
+}
+
+RESOURCE_TYPE_NAMES = {
+    1: "光标",
+    2: "位图",
+    3: "图标",
+    4: "菜单",
+    5: "对话框",
+    6: "字符串表",
+    10: "自定义数据",
+    14: "图标组",
+    16: "版本信息",
+    24: "应用清单",
+}
 
 
 @dataclass(frozen=True)
@@ -24,6 +59,12 @@ class DataDirectory:
     index: int
     rva: int
     size: int
+
+    @property
+    def name(self) -> str:
+        """返回目录的常用名称。"""
+
+        return DATA_DIRECTORY_NAMES.get(self.index, f"目录 {self.index}")
 
 
 @dataclass(frozen=True)
@@ -36,6 +77,19 @@ class Section:
     raw_size: int
     raw_pointer: int
     entropy: float
+    characteristics: int
+
+    @property
+    def end_rva(self) -> int:
+        """节区虚拟地址范围结尾。"""
+
+        return self.virtual_address + max(self.virtual_size, self.raw_size)
+
+    @property
+    def is_virtual_only(self) -> bool:
+        """判断节区是否只有内存大小而没有磁盘原始数据。"""
+
+        return self.virtual_size > 0 and self.raw_size == 0
 
 
 @dataclass(frozen=True)
@@ -47,11 +101,42 @@ class ImportEntry:
 
 
 @dataclass(frozen=True)
+class ResourceEntry:
+    """资源表叶子节点。"""
+
+    type_id: int | None
+    type_name: str
+    name_id: int | None
+    language_id: int | None
+    rva: int
+    size: int
+    codepage: int
+    data: bytes
+
+    @property
+    def text(self) -> str | None:
+        """尝试把文本型资源解码为字符串。"""
+
+        if not self.data:
+            return None
+        for encoding in ("utf-8-sig", "utf-16-le", "latin1"):
+            try:
+                decoded = self.data.rstrip(b"\0").decode(encoding)
+            except UnicodeDecodeError:
+                continue
+            if decoded and sum(ch.isprintable() or ch in "\r\n\t" for ch in decoded) / len(decoded) > 0.9:
+                return decoded
+        return None
+
+
+@dataclass(frozen=True)
 class PEImage:
     """解析后的 PE 映像摘要。"""
 
     path: Path
     size: int
+    sha256: str
+    timestamp: int
     machine: int
     is_pe32_plus: bool
     subsystem: int
@@ -60,6 +145,13 @@ class PEImage:
     sections: tuple[Section, ...]
     directories: tuple[DataDirectory, ...]
     imports: tuple[ImportEntry, ...]
+    resources: tuple[ResourceEntry, ...]
+
+    @property
+    def timestamp_utc(self) -> str:
+        """返回 COFF 时间戳的 UTC 表示。"""
+
+        return _dt.datetime.fromtimestamp(self.timestamp, tz=_dt.UTC).isoformat()
 
     @property
     def architecture(self) -> str:
@@ -76,6 +168,41 @@ class PEImage:
             3: "Windows 控制台程序",
         }.get(self.subsystem, f"未知子系统 {self.subsystem}")
 
+    @property
+    def entry_point_section(self) -> Section | None:
+        """返回入口点所在节区。"""
+
+        return self.section_for_rva(self.entry_point_rva)
+
+    @property
+    def manifest_text(self) -> str | None:
+        """返回嵌入式应用清单文本。"""
+
+        for resource in self.resources:
+            if resource.type_id == 24:
+                return resource.text
+        return None
+
+    @property
+    def protection_findings(self) -> tuple[str, ...]:
+        """基于静态证据生成保护/加壳判断。"""
+
+        findings: list[str] = []
+        virtual_sections = [section.name for section in self.sections if section.is_virtual_only]
+        if virtual_sections:
+            findings.append(f"存在 {len(virtual_sections)} 个 RawSize=0 的虚拟节区：{', '.join(virtual_sections)}")
+        high_entropy = [section.name for section in self.sections if section.raw_size and section.entropy >= 7.2]
+        if high_entropy:
+            findings.append(f"存在高熵原始节区：{', '.join(high_entropy)}")
+        entry_section = self.entry_point_section
+        if entry_section is not None and entry_section.entropy >= 7.2:
+            findings.append(f"入口点落在高熵节区 {entry_section.name}")
+        if len(self.imports) <= 16:
+            findings.append(f"导入函数数量很少（{len(self.imports)} 个），符合壳加载器特征")
+        if self.directory(14).rva == 0:
+            findings.append("未发现 .NET 运行时目录，当前样本不像直接可反编译的 .NET 程序")
+        return tuple(findings)
+
     def directory(self, index: int) -> DataDirectory:
         """按索引读取数据目录。"""
 
@@ -88,8 +215,7 @@ class PEImage:
         """查找包含指定 RVA 的节区。"""
 
         for section in self.sections:
-            size = max(section.virtual_size, section.raw_size)
-            if section.virtual_address <= rva < section.virtual_address + size:
+            if section.virtual_address <= rva < section.end_rva:
                 return section
         return None
 
@@ -99,7 +225,10 @@ class PEImage:
         section = self.section_for_rva(rva)
         if section is None or section.raw_size == 0:
             return None
-        return section.raw_pointer + (rva - section.virtual_address)
+        delta = rva - section.virtual_address
+        if delta >= section.raw_size:
+            return None
+        return section.raw_pointer + delta
 
 
 def parse_pe(path: str | Path) -> PEImage:
@@ -117,6 +246,7 @@ def parse_pe(path: str | Path) -> PEImage:
     coff_offset = pe_offset + 4
     machine = _u16(data, coff_offset)
     section_count = _u16(data, coff_offset + 2)
+    timestamp = _u32(data, coff_offset + 4)
     optional_header_size = _u16(data, coff_offset + 16)
     optional_offset = coff_offset + 20
     optional_magic = _u16(data, optional_offset)
@@ -139,6 +269,8 @@ def parse_pe(path: str | Path) -> PEImage:
     image = PEImage(
         path=pe_path,
         size=len(data),
+        sha256=hashlib.sha256(data).hexdigest(),
+        timestamp=timestamp,
         machine=machine,
         is_pe32_plus=is_pe32_plus,
         subsystem=subsystem,
@@ -147,10 +279,13 @@ def parse_pe(path: str | Path) -> PEImage:
         sections=sections,
         directories=directories,
         imports=(),
+        resources=(),
     )
     return PEImage(
         path=image.path,
         size=image.size,
+        sha256=image.sha256,
+        timestamp=image.timestamp,
         machine=image.machine,
         is_pe32_plus=image.is_pe32_plus,
         subsystem=image.subsystem,
@@ -159,6 +294,7 @@ def parse_pe(path: str | Path) -> PEImage:
         sections=image.sections,
         directories=image.directories,
         imports=tuple(_parse_imports(data, image)),
+        resources=tuple(_parse_resources(data, image)),
     )
 
 
@@ -177,6 +313,7 @@ def _parse_section(data: bytes, offset: int) -> Section:
         raw_size=raw_size,
         raw_pointer=raw_pointer,
         entropy=_entropy(raw_data),
+        characteristics=_u32(data, offset + 36),
     )
 
 
@@ -221,6 +358,62 @@ def _parse_thunks(data: bytes, image: PEImage, dll: str, thunk_offset: int) -> I
         entries.append(ImportEntry(dll=dll, name=name))
         cursor += step
     return entries
+
+
+def _parse_resources(data: bytes, image: PEImage) -> Iterable[ResourceEntry]:
+    directory = image.directory(2)
+    base_offset = image.rva_to_offset(directory.rva)
+    if base_offset is None or directory.size == 0:
+        return ()
+
+    resources: list[ResourceEntry] = []
+
+    def walk(relative_offset: int, levels: tuple[int | None, ...]) -> None:
+        directory_offset = base_offset + relative_offset
+        if directory_offset + 16 > len(data):
+            return
+        named_count = _u16(data, directory_offset + 12)
+        id_count = _u16(data, directory_offset + 14)
+        entry_count = named_count + id_count
+        entries_offset = directory_offset + 16
+        for index in range(entry_count):
+            entry_offset = entries_offset + index * 8
+            if entry_offset + 8 > len(data):
+                continue
+            name_raw = _u32(data, entry_offset)
+            value_raw = _u32(data, entry_offset + 4)
+            identifier = None if name_raw & 0x80000000 else name_raw
+            child_levels = (*levels, identifier)
+            if value_raw & 0x80000000:
+                walk(value_raw & 0x7FFFFFFF, child_levels)
+            else:
+                data_entry_offset = base_offset + value_raw
+                if data_entry_offset + 16 > len(data):
+                    continue
+                data_rva = _u32(data, data_entry_offset)
+                size = _u32(data, data_entry_offset + 4)
+                codepage = _u32(data, data_entry_offset + 8)
+                payload_offset = image.rva_to_offset(data_rva)
+                payload = data[payload_offset : payload_offset + size] if payload_offset is not None else b""
+                type_id = child_levels[0] if len(child_levels) > 0 else None
+                type_name = RESOURCE_TYPE_NAMES.get(type_id, f"资源类型 {type_id}") if type_id is not None else "命名资源"
+                name_id = child_levels[1] if len(child_levels) > 1 else None
+                language_id = child_levels[2] if len(child_levels) > 2 else None
+                resources.append(
+                    ResourceEntry(
+                        type_id=type_id,
+                        type_name=type_name,
+                        name_id=name_id,
+                        language_id=language_id,
+                        rva=data_rva,
+                        size=size,
+                        codepage=codepage,
+                        data=payload,
+                    )
+                )
+
+    walk(0, ())
+    return resources
 
 
 def _entropy(data: bytes) -> float:
